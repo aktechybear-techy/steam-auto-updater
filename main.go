@@ -52,22 +52,38 @@ type steamInstall struct {
 	LibraryDirs []string
 }
 
+type config struct {
+	ScheduleOn  bool   `json:"schedule_on"`
+	WindowStart string `json:"window_start"` // "01:00", 24h
+	WindowEnd   string `json:"window_end"`   // "07:00", 24h
+	CloseSteam  bool   `json:"close_steam_when_done"`
+}
+
 var (
-	mw           *walk.MainWindow
-	tv           *walk.TableView
-	lblLib       *walk.Label
-	chkStart     *walk.CheckBox
-	chkClose     *walk.CheckBox
-	sbi          *walk.StatusBarItem
-	model        = &gameModel{}
-	busy         atomic.Bool
+	mw            *walk.MainWindow
+	tv            *walk.TableView
+	lblLib        *walk.Label
+	chkStart      *walk.CheckBox
+	chkClose      *walk.CheckBox
+	chkSched      *walk.CheckBox
+	edStart       *walk.LineEdit
+	edEnd         *walk.LineEdit
+	sbi           *walk.StatusBarItem
+	model         = &gameModel{}
+	cfg           config
+	busy          atomic.Bool
 	closeWhenDone atomic.Bool
+	lastCheck     atomic.Int64
+	pendingCount  atomic.Int64
 )
 
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 func main() {
 	runtime.LockOSThread()
+
+	cfg = loadConfig()
+	closeWhenDone.Store(cfg.CloseSteam)
 
 	if err := (MainWindow{
 		AssignTo: &mw,
@@ -90,11 +106,33 @@ func main() {
 			Composite{
 				Layout: HBox{Margins: Margins{Left: 10, Top: 6, Right: 10, Bottom: 10}},
 				Children: []Widget{
-					PushButton{Text: "Check now", OnClicked: func() { go runCycle(true) }},
+					PushButton{Text: "Check now", OnClicked: func() { go runCycle(true, true) }},
 					CheckBox{AssignTo: &chkStart, Text: "Start with Windows", Checked: startupEnabled(),
 						OnClicked: func() { setStartup(chkStart.Checked()) }},
-					CheckBox{AssignTo: &chkClose, Text: "Close Steam when done", Checked: true,
-						OnClicked: func() { closeWhenDone.Store(chkClose.Checked()) }},
+					CheckBox{AssignTo: &chkClose, Text: "Close Steam when done", Checked: cfg.CloseSteam,
+						OnClicked: func() {
+							closeWhenDone.Store(chkClose.Checked())
+							cfg.CloseSteam = chkClose.Checked()
+							saveConfig()
+						}},
+				},
+			},
+			Composite{
+				Layout: HBox{Margins: Margins{Left: 10, Top: 0, Right: 10, Bottom: 10}},
+				Children: []Widget{
+					CheckBox{AssignTo: &chkSched, Text: "Only update on a schedule", Checked: cfg.ScheduleOn,
+						OnClicked: func() {
+							cfg.ScheduleOn = chkSched.Checked()
+							edStart.SetEnabled(cfg.ScheduleOn)
+							edEnd.SetEnabled(cfg.ScheduleOn)
+							saveConfig()
+						}},
+					Label{Text: "Window:"},
+					LineEdit{AssignTo: &edStart, Text: cfg.WindowStart, MinSize: Size{Width: 60, Height: 22},
+						OnEditingFinished: applyScheduleEdits},
+					Label{Text: "to"},
+					LineEdit{AssignTo: &edEnd, Text: cfg.WindowEnd, MinSize: Size{Width: 60, Height: 22},
+						OnEditingFinished: applyScheduleEdits},
 				},
 			},
 		},
@@ -103,11 +141,29 @@ func main() {
 		log.Fatal(err)
 	}
 
+	edStart.SetEnabled(cfg.ScheduleOn)
+	edEnd.SetEnabled(cfg.ScheduleOn)
+
 	go func() {
-		runCycle(true)
-		t := time.NewTicker(checkInterval)
+		runCycle(false, inWindow(time.Now()))
+		prevIn := inWindow(time.Now())
+		t := time.NewTicker(time.Minute)
 		for range t.C {
-			runCycle(false)
+			cur := inWindow(time.Now())
+			if cur && (!prevIn || time.Since(time.Unix(lastCheck.Load(), 0)) >= checkInterval) {
+				go runCycle(false, true)
+			}
+			if cfg.ScheduleOn && !cur {
+				p := pendingCount.Load()
+				ui(func() {
+					if p == 0 {
+						sbi.SetText(fmt.Sprintf("Paused — outside schedule window (%s–%s).", cfg.WindowStart, cfg.WindowEnd))
+					} else {
+						sbi.SetText(fmt.Sprintf("Paused — %d update(s) waiting for window (%s–%s).", p, cfg.WindowStart, cfg.WindowEnd))
+					}
+				})
+			}
+			prevIn = cur
 		}
 	}()
 
@@ -118,7 +174,7 @@ func main() {
 func ui(f func()) { mw.Synchronize(f) }
 
 // runCycle scans the libraries, checks every game, and kicks Steam if needed.
-func runCycle(manual bool) {
+func runCycle(manual, kickAllowed bool) {
 	if !busy.CompareAndSwap(false, true) {
 		if manual {
 			ui(func() { sbi.SetText("A check is already running.") })
@@ -166,8 +222,17 @@ func runCycle(manual bool) {
 			sbi.SetText(fmt.Sprintf("Checked at %s — %d of %d games need updates.", checkedAt, stale, len(games)))
 		}
 	})
+	lastCheck.Store(time.Now().Unix())
+	pendingCount.Store(int64(stale))
 
 	if stale == 0 {
+		return
+	}
+
+	if !inWindow(time.Now()) && !kickAllowed {
+		ui(func() {
+			sbi.SetText(fmt.Sprintf("%d game(s) need updates — waiting for schedule window (%s–%s).", stale, cfg.WindowStart, cfg.WindowEnd))
+		})
 		return
 	}
 
@@ -207,6 +272,93 @@ func runCycle(manual bool) {
 		ui(func() { sbi.SetText(fmt.Sprintf("Steam is updating %d game(s)…", remaining)) })
 	}
 	ui(func() { sbi.SetText("Updates still pending after 15 min — Steam left running.") })
+}
+
+// ---------- schedule ----------
+
+func configPath() string {
+	if d, err := os.UserConfigDir(); err == nil && d != "" {
+		return filepath.Join(d, "SteamAutoUpdater", "config.json")
+	}
+	exe, err := os.Executable()
+	if err == nil {
+		return filepath.Join(filepath.Dir(exe), "config.json")
+	}
+	return "config.json"
+}
+
+func loadConfig() config {
+	c := config{WindowStart: "01:00", WindowEnd: "07:00", CloseSteam: true}
+	data, err := os.ReadFile(configPath())
+	if err != nil {
+		return c
+	}
+	_ = json.Unmarshal(data, &c)
+	return c
+}
+
+func saveConfig() {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(configPath()), 0o755)
+	_ = os.WriteFile(configPath(), data, 0o644)
+}
+
+// parseHHMM parses "H:MM" or "HH:MM" (24h) into minutes past midnight.
+func parseHHMM(s string) (int, bool) {
+	parts := strings.Split(strings.TrimSpace(s), ":")
+	if len(parts) != 2 {
+		return 0, false
+	}
+	h, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	m, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil {
+		return 0, false
+	}
+	if h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, false
+	}
+	return h*60 + m, true
+}
+
+// inWindow reports whether now falls inside the configured schedule window.
+// Windows may wrap midnight (22:00–06:00). With the schedule off it is always
+// true; if the config is invalid it is also true (behave as unscheduled).
+func inWindow(now time.Time) bool {
+	if !cfg.ScheduleOn {
+		return true
+	}
+	start, ok1 := parseHHMM(cfg.WindowStart)
+	end, ok2 := parseHHMM(cfg.WindowEnd)
+	if !ok1 || !ok2 {
+		return true
+	}
+	if start == end {
+		return true
+	}
+	m := now.Hour()*60 + now.Minute()
+	if start < end {
+		return m >= start && m < end
+	}
+	return m >= start || m < end
+}
+
+// applyScheduleEdits validates and saves the window fields. UI thread only.
+func applyScheduleEdits() {
+	start, ok1 := parseHHMM(edStart.Text())
+	end, ok2 := parseHHMM(edEnd.Text())
+	if !ok1 || !ok2 {
+		sbi.SetText("Schedule times must be HH:MM (24h), e.g. 01:00.")
+		return
+	}
+	cfg.WindowStart = fmt.Sprintf("%02d:%02d", start/60, start%60)
+	cfg.WindowEnd = fmt.Sprintf("%02d:%02d", end/60, end%60)
+	edStart.SetText(cfg.WindowStart)
+	edEnd.SetText(cfg.WindowEnd)
+	saveConfig()
+	sbi.SetText(fmt.Sprintf("Schedule window saved: %s–%s.", cfg.WindowStart, cfg.WindowEnd))
 }
 
 // ---------- model ----------
