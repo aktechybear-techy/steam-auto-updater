@@ -79,6 +79,7 @@ var (
 	forceRestart  atomic.Bool
 	lastCheck     atomic.Int64
 	pendingCount  atomic.Int64
+	forceStrikes  atomic.Int64
 )
 
 var httpClient = &http.Client{Timeout: 15 * time.Second}
@@ -270,6 +271,13 @@ func runCycle(manual, kickAllowed bool) {
 			})
 			return
 		}
+		if strikes := forceStrikes.Load(); strikes >= 2 {
+			logf("steam running, %d pending; forcing disabled after %d unsuccessful restarts", stale, strikes)
+			ui(func() {
+				sbi.SetText(fmt.Sprintf("Steam left running — %d pending update(s) did not clear after restarts. Check Steam.", stale))
+			})
+			return
+		}
 		logf("steam running, no game active; restarting it to force pending updates")
 		ui(func() { sbi.SetText("Steam is running — restarting it to force pending updates…") })
 		if !closeSteam() {
@@ -305,6 +313,7 @@ func runCycle(manual, kickAllowed bool) {
 		snap := append([]game(nil), fresh...)
 		ui(func() { model.publish(snap) })
 		if remaining == 0 {
+			forceStrikes.Store(0)
 			if closeWhenDone.Load() {
 				logf("all games up to date — closing Steam (we started it)")
 				ui(func() { sbi.SetText("All games up to date — closing Steam…") })
@@ -315,7 +324,8 @@ func runCycle(manual, kickAllowed bool) {
 		}
 		ui(func() { sbi.SetText(fmt.Sprintf("Steam is updating %d game(s)…", remaining)) })
 	}
-	logf("monitor: 15 min deadline reached, Steam left running")
+	forceStrikes.Add(1)
+	logf("monitor: 15 min deadline reached, Steam left running (pending did not clear)")
 	ui(func() { sbi.SetText("Updates still pending after 15 min — Steam left running.") })
 }
 
@@ -486,6 +496,10 @@ func checkStatus(g *game) string {
 		logf("appid %s (%s): up to date (%dms)", g.AppID, g.Name, time.Since(start).Milliseconds())
 		return "Up to date"
 	}
+	if r.Response.RequiredVersion == 0 {
+		logf("appid %s (%s): server says out of date but gives no target build; treating as Unknown (%dms)", g.AppID, g.Name, time.Since(start).Milliseconds())
+		return "Unknown"
+	}
 	logf("appid %s (%s): UPDATE AVAILABLE, local build %s -> required %d (%dms)", g.AppID, g.Name, g.BuildID, r.Response.RequiredVersion, time.Since(start).Milliseconds())
 	return "Update available"
 }
@@ -607,8 +621,9 @@ func readGames(inst *steamInstall) []game {
 				continue
 			}
 			m := acfPairs(string(data))
-			if m["stateflags"] != "4" {
-				continue
+			flags, err := strconv.Atoi(m["stateflags"])
+			if err != nil || flags&4 == 0 {
+				continue // bit 4 = fully installed; extra bits (pending update etc.) must not exclude a game
 			}
 			id := m["appid"]
 			if id == "" || seen[id] {
