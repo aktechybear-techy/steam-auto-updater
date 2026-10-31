@@ -313,20 +313,32 @@ func runCycle(manual, kickAllowed bool) {
 			return
 		}
 		weStarted = true
-		logf("launched steam.exe -silent -cef-enable-debugging; waiting for the debug port")
+		logf("launched steam.exe -silent -cef-enable-debugging; waiting for Steam's UI to be ready")
 		ui(func() { sbi.SetText("Steam starting with the debug flag…") })
-		if !waitForCDP(90 * time.Second) {
-			logf("debug port never came up after 90s; leaving updates to Steam")
-			ui(func() { sbi.SetText("Steam started but its debug port is not available — updates left to Steam.") })
-			return
-		}
+	}
+
+	// The debug port answers before Steam's UI finishes booting; wait until
+	// the SteamClient API actually exists or every queue call would fail.
+	if !waitForSteamAPI(150 * time.Second) {
+		logf("steam UI API not ready after 150s; leaving updates to Steam")
+		ui(func() { sbi.SetText("Steam's UI API is not responding — updates left to Steam. See the log.") })
+		return
 	}
 
 	fired := 0
 	for _, appid := range staleGames {
-		if err := cdpQueueUpdate(appid); err != nil {
-			logf("appid %s: queue call failed: %v", appid, err)
-		} else {
+		queued := false
+		for attempt := 1; attempt <= 3 && !queued; attempt++ {
+			if err := cdpQueueUpdate(appid); err != nil {
+				logf("appid %s: queue call failed (attempt %d/3): %v", appid, attempt, err)
+				if attempt < 3 {
+					time.Sleep(5 * time.Second)
+				}
+			} else {
+				queued = true
+			}
+		}
+		if queued {
 			fired++
 			logf("appid %s: update queued via Steam's UI API", appid)
 		}
@@ -738,6 +750,13 @@ func closeSteam() bool {
 
 const cdpBase = "http://localhost:8080"
 
+// Hard timeouts everywhere: a half-booted Steam debug port accepts TCP
+// connections but may never answer, which used to hang a cycle forever.
+var (
+	cdpHTTP   = &http.Client{Timeout: 5 * time.Second}
+	cdpDialer = &websocket.Dialer{HandshakeTimeout: 5 * time.Second}
+)
+
 // cdpEnabled reports whether Steam's CEF debug port is listening.
 func cdpEnabled() bool {
 	conn, err := net.DialTimeout("tcp", "127.0.0.1:8080", 700*time.Millisecond)
@@ -748,22 +767,46 @@ func cdpEnabled() bool {
 	return true
 }
 
-// waitForCDP polls for the debug port, e.g. right after launching Steam.
-func waitForCDP(timeout time.Duration) bool {
+// waitForSteamAPI waits until Steam's debug port is up AND its UI exposes
+// the full SteamClient API (SharedJSContext fully booted), so queue calls
+// are not fired into a half-started client.
+func waitForSteamAPI(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if cdpEnabled() {
-			return true
+			if ok, err := cdpEval("typeof SteamClient === 'object' && typeof SteamClient.Downloads === 'object'"); err == nil && ok == "true" {
+				return true
+			}
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(3 * time.Second)
 	}
 	return false
 }
 
-// cdpEval connects to Steam's debug port, finds a page context that has the
-// full SteamClient API (the SharedJSContext), and evaluates expr there.
+// cdpEval evaluates expr in Steam's SharedJSContext with an overall
+// deadline, so a half-booted debug port can never hang a cycle.
 func cdpEval(expr string) (string, error) {
-	resp, err := http.Get(cdpBase + "/json")
+	type res struct {
+		val string
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		v, e := cdpEvalRaw(expr)
+		ch <- res{v, e}
+	}()
+	select {
+	case r := <-ch:
+		return r.val, r.err
+	case <-time.After(20 * time.Second):
+		return "", fmt.Errorf("cdp eval timed out after 20s")
+	}
+}
+
+// cdpEvalRaw connects to Steam's debug port, finds a page context that has
+// the full SteamClient API (the SharedJSContext), and evaluates expr there.
+func cdpEvalRaw(expr string) (string, error) {
+	resp, err := cdpHTTP.Get(cdpBase + "/json")
 	if err != nil {
 		return "", err
 	}
@@ -790,7 +833,7 @@ func cdpEval(expr string) (string, error) {
 	}
 
 	for _, i := range order {
-		ws, _, err := websocket.DefaultDialer.Dial(targets[i].WebSocketDebuggerURL, nil)
+		ws, _, err := cdpDialer.Dial(targets[i].WebSocketDebuggerURL, nil)
 		if err != nil {
 			continue
 		}
