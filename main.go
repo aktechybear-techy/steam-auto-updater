@@ -45,6 +45,7 @@ type game struct {
 	Name    string
 	BuildID string
 	Size    int64
+	Flags   int // StateFlags bitmask: 4 = installed, 2 = update pending (Steam's own verdict)
 	Status  string
 }
 
@@ -220,8 +221,13 @@ func runCycle(manual, kickAllowed bool) {
 
 	stale := 0
 	for i := range games {
-		games[i].Status = checkStatus(&games[i])
-		if games[i].Status == "Update available" {
+		if games[i].Flags&2 != 0 {
+			logf("appid %s (%s): UPDATE PENDING (Steam manifest flag)", games[i].AppID, games[i].Name)
+			games[i].Status = "Update pending"
+		} else {
+			games[i].Status = checkStatus(&games[i])
+		}
+		if games[i].Status == "Update available" || games[i].Status == "Update pending" {
 			stale++
 		}
 		snap := append([]game(nil), games...)
@@ -302,8 +308,12 @@ func runCycle(manual, kickAllowed bool) {
 		fresh := readGames(inst)
 		remaining := 0
 		for i := range fresh {
-			fresh[i].Status = checkStatus(&fresh[i])
-			if fresh[i].Status == "Update available" {
+			if fresh[i].Flags&2 != 0 {
+				fresh[i].Status = "Update pending"
+			} else {
+				fresh[i].Status = checkStatus(&fresh[i])
+			}
+			if fresh[i].Status == "Update available" || fresh[i].Status == "Update pending" {
 				remaining++
 			}
 			time.Sleep(120 * time.Millisecond)
@@ -635,7 +645,7 @@ func readGames(inst *steamInstall) []game {
 				name = "App " + id
 			}
 			size, _ := strconv.ParseInt(m["sizeondisk"], 10, 64)
-			games = append(games, game{AppID: id, Name: name, BuildID: m["buildid"], Size: size})
+			games = append(games, game{AppID: id, Name: name, BuildID: m["buildid"], Size: size, Flags: flags})
 		}
 	}
 	sort.Slice(games, func(i, j int) bool { return games[i].Name < games[j].Name })

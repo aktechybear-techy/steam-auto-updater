@@ -6,7 +6,7 @@ A tiny Windows app that detects installed Steam games and keeps them updated. It
 
 1. Finds Steam via the registry (HKCU\Software\Valve\Steam), including extra libraries from libraryfolders.vdf.
 2. Parses every appmanifest_*.acf to list installed games and their current build IDs.
-3. Asks api.steampowered.com whether each build is current.
+3. Detects pending updates two ways: Steam's own manifest flag (exactly what the Steam client shows) plus Valve's public UpToDateCheck API for apps that support it.
 4. If games are stale and Steam is closed: launches steam.exe -silent, waits (up to 15 min), then closes Steam.
 5. If Steam is already running: reports the pending updates and lets Steam handle them.
 6. Optionally updates only inside a daily schedule window you set.
@@ -25,7 +25,7 @@ A tiny Windows app that detects installed Steam games and keeps them updated. It
 ## How to verify it works (pass/fail)
 
 1. Launch it. The window shows the Steam path at top and a list of every installed game with sizes. PASS if games appear. FAIL if the list is empty and the top line says "Steam not found".
-2. Status column shows "Up to date" for current games. A game you know is current should read "Up to date". "Unknown" is normal for DLC or tools without a public build.
+2. Status column: "Up to date", "Update available" (detected via Valve API), "Update pending" (Steam's own flag — matches what the Steam client shows), or "Unknown" (no data available for that app).
 3. Click "Check now". The status bar counts up ("Checking N of M…") and each row flips from Checking to its result as it completes. PASS if the count advances and rows settle on "Up to date" / "Update available" / "Unknown".
 4. Schedule: check "Only update on a schedule". Set the window to a range that includes right now (e.g. 00:00 to 23:00). Within a minute the status bar returns to normal checking. PASS if checks keep happening.
 5. Schedule pause: set the window to a range that excludes right now (e.g. 01:00 to 05:00 during daytime). Within one minute the status bar reads "Paused — outside schedule window (01:00–05:00)". PASS if it pauses and Steam never opens.
@@ -64,5 +64,5 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -H=wi
 - Honors Steam's own per-game update settings when it kicks Steam.
 - Never kills Steam it did not start.
 - No tray icon yet; keep the window minimized and the schedule keeps running.
-- The UpToDateCheck API reflects public builds; beta-branch games may read "Update available" repeatedly.
+- Valve's UpToDateCheck API returns no data for many modern games; those rely on Steam's own manifest flag, so the app always agrees with what Steam shows. Beta-branch games on API-supported apps may read Update available repeatedly.
 - Schedule is a single daily window (one start/end pair). Multiple windows per day are not supported yet.
