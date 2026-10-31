@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -199,9 +200,11 @@ func runCycle(manual, kickAllowed bool) {
 	for i := range games {
 		games[i].Status = "Checking…"
 	}
+	logf("cycle start: %d games in %d libraries", len(games), len(inst.LibraryDirs))
+	snap := append([]game(nil), games...)
 	ui(func() {
 		lblLib.SetText(fmt.Sprintf("%s  —  %d games in %d libraries", inst.ExePath, len(games), len(inst.LibraryDirs)))
-		model.publish(games)
+		model.publish(snap)
 	})
 
 	stale := 0
@@ -210,18 +213,26 @@ func runCycle(manual, kickAllowed bool) {
 		if games[i].Status == "Update available" {
 			stale++
 		}
+		snap := append([]game(nil), games...)
+		n, total := i+1, len(games)
+		ui(func() {
+			model.publish(snap)
+			sbi.SetText(fmt.Sprintf("Checking %d of %d…", n, total))
+		})
 		time.Sleep(120 * time.Millisecond)
 	}
 	sort.SliceStable(games, func(i, j int) bool { return games[i].Name < games[j].Name })
 	checkedAt := time.Now().Format("3:04 PM")
+	final := append([]game(nil), games...)
 	ui(func() {
-		model.publish(games)
+		model.publish(final)
 		if stale == 0 {
-			sbi.SetText(fmt.Sprintf("Checked at %s — all %d games up to date.", checkedAt, len(games)))
+			sbi.SetText(fmt.Sprintf("Checked at %s — all %d games up to date.", checkedAt, len(final)))
 		} else {
-			sbi.SetText(fmt.Sprintf("Checked at %s — %d of %d games need updates.", checkedAt, stale, len(games)))
+			sbi.SetText(fmt.Sprintf("Checked at %s — %d of %d games need updates.", checkedAt, stale, len(final)))
 		}
 	})
+	logf("cycle done: %d games checked, %d need updates", len(final), stale)
 	lastCheck.Store(time.Now().Unix())
 	pendingCount.Store(int64(stale))
 
@@ -237,14 +248,17 @@ func runCycle(manual, kickAllowed bool) {
 	}
 
 	if steamRunning() {
+		logf("steam already running; deferring updates to it")
 		ui(func() { sbi.SetText("Steam is already running — it will apply these updates itself.") })
 		return
 	}
 
 	if err := startSteam(inst); err != nil {
+		logf("failed to start steam: %v", err)
 		ui(func() { sbi.SetText("Could not start Steam: " + err.Error()) })
 		return
 	}
+	logf("launched steam.exe -silent, monitoring for completion")
 	ui(func() { sbi.SetText(fmt.Sprintf("Steam started in the tray — updating %d game(s)…", stale)) })
 
 	deadline := time.Now().Add(kickTimeout)
@@ -260,9 +274,12 @@ func runCycle(manual, kickAllowed bool) {
 			time.Sleep(120 * time.Millisecond)
 		}
 		sort.SliceStable(fresh, func(i, j int) bool { return fresh[i].Name < fresh[j].Name })
-		ui(func() { model.publish(fresh) })
+		logf("monitor: %d update(s) still pending", remaining)
+		snap := append([]game(nil), fresh...)
+		ui(func() { model.publish(snap) })
 		if remaining == 0 {
 			if closeWhenDone.Load() {
+				logf("all games up to date — closing Steam (we started it)")
 				ui(func() { sbi.SetText("All games up to date — closing Steam…") })
 				closeSteam()
 			}
@@ -271,7 +288,29 @@ func runCycle(manual, kickAllowed bool) {
 		}
 		ui(func() { sbi.SetText(fmt.Sprintf("Steam is updating %d game(s)…", remaining)) })
 	}
+	logf("monitor: 15 min deadline reached, Steam left running")
 	ui(func() { sbi.SetText("Updates still pending after 15 min — Steam left running.") })
+}
+
+// ---------- logging ----------
+
+var logMu sync.Mutex
+
+func logPath() string {
+	return filepath.Join(filepath.Dir(configPath()), "log.txt")
+}
+
+// logf appends a timestamped line to %APPDATA%\SteamAutoUpdater\log.txt.
+func logf(format string, args ...interface{}) {
+	line := time.Now().Format("2006-01-02 15:04:05") + " " + fmt.Sprintf(format, args...) + "\n"
+	logMu.Lock()
+	defer logMu.Unlock()
+	f, err := os.OpenFile(logPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(line)
 }
 
 // ---------- schedule ----------
@@ -395,25 +434,32 @@ func (m *gameModel) publish(gs []game) {
 
 func checkStatus(g *game) string {
 	if strings.TrimSpace(g.BuildID) == "" {
+		logf("appid %s (%s): no buildid, status Unknown", g.AppID, g.Name)
 		return "Unknown"
 	}
+	start := time.Now()
 	resp, err := httpClient.Get(fmt.Sprintf(apiURL, g.AppID, g.BuildID))
 	if err != nil {
+		logf("appid %s (%s): request FAILED after %dms: %v", g.AppID, g.Name, time.Since(start).Milliseconds(), err)
 		return "Unknown"
 	}
 	defer resp.Body.Close()
 	var r struct {
 		Response struct {
-			Success  bool `json:"success"`
-			UpToDate bool `json:"up_to_date"`
+			Success         bool  `json:"success"`
+			UpToDate        bool  `json:"up_to_date"`
+			RequiredVersion int64 `json:"required_version"`
 		} `json:"response"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil || !r.Response.Success {
+		logf("appid %s (%s): unreadable response after %dms (decode err: %v, success: %v)", g.AppID, g.Name, time.Since(start).Milliseconds(), err, r.Response.Success)
 		return "Unknown"
 	}
 	if r.Response.UpToDate {
+		logf("appid %s (%s): up to date (%dms)", g.AppID, g.Name, time.Since(start).Milliseconds())
 		return "Up to date"
 	}
+	logf("appid %s (%s): UPDATE AVAILABLE, local build %s -> required %d (%dms)", g.AppID, g.Name, g.BuildID, r.Response.RequiredVersion, time.Since(start).Milliseconds())
 	return "Update available"
 }
 

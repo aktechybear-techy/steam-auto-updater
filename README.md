@@ -26,7 +26,7 @@ A tiny Windows app that detects installed Steam games and keeps them updated. It
 
 1. Launch it. The window shows the Steam path at top and a list of every installed game with sizes. PASS if games appear. FAIL if the list is empty and the top line says "Steam not found".
 2. Status column shows "Up to date" for current games. A game you know is current should read "Up to date". "Unknown" is normal for DLC or tools without a public build.
-3. Click "Check now". The status bar shows "Checked at <time> — all N games up to date." or "N of M games need updates."
+3. Click "Check now". The status bar counts up ("Checking N of M…") and each row flips from Checking to its result as it completes. PASS if the count advances and rows settle on "Up to date" / "Update available" / "Unknown".
 4. Schedule: check "Only update on a schedule". Set the window to a range that includes right now (e.g. 00:00 to 23:00). Within a minute the status bar returns to normal checking. PASS if checks keep happening.
 5. Schedule pause: set the window to a range that excludes right now (e.g. 01:00 to 05:00 during daytime). Within one minute the status bar reads "Paused — outside schedule window (01:00–05:00)". PASS if it pauses and Steam never opens.
 6. Typing "abc" into a window field and pressing Enter shows "Schedule times must be HH:MM (24h)" and does not save. PASS if bad input is rejected.
@@ -49,6 +49,7 @@ A tiny Windows app that detects installed Steam games and keeps them updated. It
 - "Start with Windows": writes HKCU\...\Run\SteamAutoUpdater. Remove with the checkbox or delete the value.
 - "Only update on a schedule" plus the window: stored in %APPDATA%\SteamAutoUpdater\config.json along with the Close-Steam preference.
 - Check interval is 30 minutes inside the active window.
+- Log file: %APPDATA%\SteamAutoUpdater\log.txt records every API check (game, result, milliseconds) plus Steam kick/monitor events. Include this file in any bug report.
 
 ## Build from source (from the Mac mini)
 
