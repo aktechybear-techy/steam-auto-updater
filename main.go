@@ -178,6 +178,7 @@ func main() {
 					}
 				})
 			}
+			refreshStatuses()
 			prevIn = cur
 		}
 	}()
@@ -187,6 +188,52 @@ func main() {
 
 // ui runs f on the UI thread.
 func ui(f func()) { mw.Synchronize(f) }
+
+// refreshStatuses re-reads the manifests and updates the table without any
+// API calls, so rows flip "Update pending" -> "Up to date" live as Steam
+// finishes each download. Runs every minute from the main ticker; cycles
+// and monitors publish their own snapshots (guarded by busy).
+func refreshStatuses() {
+	if busy.Load() {
+		return
+	}
+	inst, err := findSteam()
+	if err != nil {
+		return
+	}
+	fresh := readGames(inst)
+	byID := make(map[string]game, len(fresh))
+	for _, g := range fresh {
+		byID[g.AppID] = g
+	}
+	changed := false
+	ui(func() {
+		rows := model.games
+		for i := range rows {
+			f, ok := byID[rows[i].AppID]
+			if !ok {
+				continue
+			}
+			if f.Size != rows[i].Size {
+				rows[i].Size = f.Size
+				changed = true
+			}
+			switch {
+			case f.Flags&2 != 0:
+				if rows[i].Status != "Update pending" {
+					rows[i].Status = "Update pending"
+					changed = true
+				}
+			case rows[i].Status == "Update pending" || rows[i].Status == "Checking…":
+				rows[i].Status = "Up to date"
+				changed = true
+			}
+		}
+		if changed {
+			model.PublishRowsReset()
+		}
+	})
+}
 
 // runCycle scans the libraries, checks every game, and kicks Steam if needed.
 func runCycle(manual, kickAllowed bool) {
@@ -351,6 +398,14 @@ func runCycle(manual, kickAllowed bool) {
 	logf("queued %d of %d pending update(s) for immediate download", fired, stale)
 	ui(func() { sbi.SetText(fmt.Sprintf("Steam is updating %d game(s)…", fired)) })
 
+	// Carry the cycle's API verdicts into the monitor: the manifest flag
+	// alone tells when an update finishes, and re-polling Valve's API every
+	// pass only rate-limited us.
+	carried := make(map[string]string, len(games))
+	for _, g := range games {
+		carried[g.AppID] = g.Status
+	}
+
 	deadline := time.Now().Add(kickTimeout)
 	for time.Now().Before(deadline) {
 		time.Sleep(kickPollEvery)
@@ -359,13 +414,14 @@ func runCycle(manual, kickAllowed bool) {
 		for i := range fresh {
 			if fresh[i].Flags&2 != 0 {
 				fresh[i].Status = "Update pending"
+			} else if carried[fresh[i].AppID] == "Update available" {
+				fresh[i].Status = "Update available"
 			} else {
-				fresh[i].Status = checkStatus(&fresh[i])
+				fresh[i].Status = "Up to date"
 			}
 			if fresh[i].Status == "Update available" || fresh[i].Status == "Update pending" {
 				remaining++
 			}
-			time.Sleep(120 * time.Millisecond)
 		}
 		sort.SliceStable(fresh, func(i, j int) bool { return fresh[i].Name < fresh[j].Name })
 		logf("monitor: %d update(s) still pending", remaining)
@@ -548,8 +604,10 @@ func checkStatus(g *game) string {
 		} `json:"response"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil || !r.Response.Success {
-		logf("appid %s (%s): unreadable response after %dms (decode err: %v, success: %v)", g.AppID, g.Name, time.Since(start).Milliseconds(), err, r.Response.Success)
-		return "Unknown"
+		logf("appid %s (%s): no API data after %dms (decode err: %v, success: %v)", g.AppID, g.Name, time.Since(start).Milliseconds(), err, r.Response.Success)
+		// Valve serves no data for many apps; the manifest carries no pending
+		// flag here, so report the local state instead of a dead end.
+		return "Up to date (local)"
 	}
 	if r.Response.UpToDate {
 		logf("appid %s (%s): up to date (%dms)", g.AppID, g.Name, time.Since(start).Milliseconds())
@@ -850,9 +908,14 @@ func cdpEvalRaw(expr string) (string, error) {
 	return "", fmt.Errorf("no Steam page context with SteamClient.Downloads found")
 }
 
+var cdpMsgID int64
+
 // cdpEvalOn runs one Runtime.evaluate over an open debug connection.
 func cdpEvalOn(ws *websocket.Conn, expr string) (string, error) {
-	id := time.Now().UnixNano()
+	// Small sequential ids only: CDP echoes the id back through a JavaScript
+	// number, and anything past 2^53 (e.g. a nanosecond timestamp) loses
+	// precision, so the reply never matches and every call times out.
+	id := atomic.AddInt64(&cdpMsgID, 1)
 	if err := ws.WriteJSON(map[string]interface{}{
 		"id":     id,
 		"method": "Runtime.evaluate",
