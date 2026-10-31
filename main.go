@@ -289,9 +289,9 @@ func runCycle(manual, kickAllowed bool) {
 			return
 		}
 		if strikes := forceStrikes.Load(); strikes >= 2 {
-			logf("steam running, %d pending; forcing disabled after %d unsuccessful restarts", stale, strikes)
+			logf("steam running, %d pending; forcing paused after %d ineffective attempts", stale, strikes)
 			ui(func() {
-				sbi.SetText(fmt.Sprintf("Steam left running — %d pending update(s) did not clear after restarts. Check Steam.", stale))
+				sbi.SetText(fmt.Sprintf("Steam left running — %d pending update(s) did not clear. Check Steam.", stale))
 			})
 			return
 		}
@@ -347,6 +347,7 @@ func runCycle(manual, kickAllowed bool) {
 		ui(func() { sbi.SetText("Could not queue updates through Steam's API — see the log.") })
 		return
 	}
+	forceStrikes.Store(0)
 	logf("queued %d of %d pending update(s) for immediate download", fired, stale)
 	ui(func() { sbi.SetText(fmt.Sprintf("Steam is updating %d game(s)…", fired)) })
 
