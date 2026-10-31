@@ -49,6 +49,7 @@ A tiny Windows app that detects installed Steam games and keeps them updated. It
 - "Start with Windows": writes HKCU\...\Run\SteamAutoUpdater. Remove with the checkbox or delete the value.
 - "Only update on a schedule" plus the window: stored in %APPDATA%\SteamAutoUpdater\config.json along with the Close-Steam preference.
 - Check interval is 30 minutes inside the active window.
+- "Force updates even if Steam is running" (default on): if updates are pending while the Steam client is open, the app restarts Steam silently to force it to re-scan and download. It never does this while a game is running (it detects Steam's child processes and backs off).
 - Log file: %APPDATA%\SteamAutoUpdater\log.txt records every API check (game, result, milliseconds) plus Steam kick/monitor events. Include this file in any bug report.
 
 ## Build from source (from the Mac mini)

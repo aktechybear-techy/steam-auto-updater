@@ -54,10 +54,11 @@ type steamInstall struct {
 }
 
 type config struct {
-	ScheduleOn  bool   `json:"schedule_on"`
-	WindowStart string `json:"window_start"` // "01:00", 24h
-	WindowEnd   string `json:"window_end"`   // "07:00", 24h
-	CloseSteam  bool   `json:"close_steam_when_done"`
+	ScheduleOn   bool   `json:"schedule_on"`
+	WindowStart  string `json:"window_start"` // "01:00", 24h
+	WindowEnd    string `json:"window_end"`   // "07:00", 24h
+	CloseSteam   bool   `json:"close_steam_when_done"`
+	ForceRestart bool   `json:"force_restart_if_steam_running"`
 }
 
 var (
@@ -67,6 +68,7 @@ var (
 	chkStart      *walk.CheckBox
 	chkClose      *walk.CheckBox
 	chkSched      *walk.CheckBox
+	chkForce      *walk.CheckBox
 	edStart       *walk.LineEdit
 	edEnd         *walk.LineEdit
 	sbi           *walk.StatusBarItem
@@ -74,6 +76,7 @@ var (
 	cfg           config
 	busy          atomic.Bool
 	closeWhenDone atomic.Bool
+	forceRestart  atomic.Bool
 	lastCheck     atomic.Int64
 	pendingCount  atomic.Int64
 )
@@ -85,6 +88,7 @@ func main() {
 
 	cfg = loadConfig()
 	closeWhenDone.Store(cfg.CloseSteam)
+	forceRestart.Store(cfg.ForceRestart)
 
 	if err := (MainWindow{
 		AssignTo: &mw,
@@ -121,6 +125,12 @@ func main() {
 			Composite{
 				Layout: HBox{Margins: Margins{Left: 10, Top: 0, Right: 10, Bottom: 10}},
 				Children: []Widget{
+					CheckBox{AssignTo: &chkForce, Text: "Force updates even if Steam is running", Checked: cfg.ForceRestart,
+						OnClicked: func() {
+							cfg.ForceRestart = chkForce.Checked()
+							forceRestart.Store(chkForce.Checked())
+							saveConfig()
+						}},
 					CheckBox{AssignTo: &chkSched, Text: "Only update on a schedule", Checked: cfg.ScheduleOn,
 						OnClicked: func() {
 							cfg.ScheduleOn = chkSched.Checked()
@@ -248,9 +258,26 @@ func runCycle(manual, kickAllowed bool) {
 	}
 
 	if steamRunning() {
-		logf("steam already running; deferring updates to it")
-		ui(func() { sbi.SetText("Steam is already running — it will apply these updates itself.") })
-		return
+		if !forceRestart.Load() {
+			logf("steam already running; force is off, deferring updates to it")
+			ui(func() { sbi.SetText("Steam is already running — it will apply these updates itself.") })
+			return
+		}
+		if busy, _ := steamBusyGame(); busy != "" {
+			logf("steam running with game %s active; not forcing a restart", busy)
+			ui(func() {
+				sbi.SetText(fmt.Sprintf("Steam is running %s — not restarting while a game is active.", busy))
+			})
+			return
+		}
+		logf("steam running, no game active; restarting it to force pending updates")
+		ui(func() { sbi.SetText("Steam is running — restarting it to force pending updates…") })
+		if !closeSteam() {
+			logf("could not stop steam; leaving it running")
+			ui(func() { sbi.SetText("Could not stop Steam — leaving it running with pending updates.") })
+			return
+		}
+		time.Sleep(3 * time.Second)
 	}
 
 	if err := startSteam(inst); err != nil {
@@ -327,7 +354,7 @@ func configPath() string {
 }
 
 func loadConfig() config {
-	c := config{WindowStart: "01:00", WindowEnd: "07:00", CloseSteam: true}
+	c := config{WindowStart: "01:00", WindowEnd: "07:00", CloseSteam: true, ForceRestart: true}
 	data, err := os.ReadFile(configPath())
 	if err != nil {
 		return c
@@ -610,19 +637,38 @@ func steamRunning() bool {
 	return strings.Contains(strings.ToLower(out), `"steam.exe"`)
 }
 
+// steamBusyGame returns the name of a Steam child process that looks like a
+// running game (anything other than Steam's own helpers), or "" if none.
+func steamBusyGame() (string, error) {
+	out, err := runHidden("powershell", "-NoProfile", "-Command",
+		"Get-CimInstance Win32_Process -Filter \"Name='steam.exe'\" | ForEach-Object { Get-CimInstance Win32_Process -Filter \"ParentProcessId=$($_.ProcessId)\" } | Select-Object -ExpandProperty Name")
+	if err != nil {
+		return "", err
+	}
+	for _, name := range strings.Fields(out) {
+		lower := strings.ToLower(name)
+		if strings.HasSuffix(lower, ".exe") && lower != "steam.exe" && lower != "steamwebhelper.exe" {
+			return name, nil
+		}
+	}
+	return "", nil
+}
+
 func startSteam(inst *steamInstall) error {
 	return exec.Command(inst.ExePath, "-silent").Start()
 }
 
-func closeSteam() {
+func closeSteam() bool {
 	_, _ = runHidden("taskkill", "/IM", "steam.exe")
 	for i := 0; i < 10; i++ {
 		time.Sleep(2 * time.Second)
 		if !steamRunning() {
-			return
+			return true
 		}
 	}
 	_, _ = runHidden("taskkill", "/F", "/IM", "steam.exe")
+	time.Sleep(2 * time.Second)
+	return !steamRunning()
 }
 
 // runHidden runs a console command without flashing a console window.
