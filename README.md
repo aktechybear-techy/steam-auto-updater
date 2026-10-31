@@ -7,8 +7,8 @@ A tiny Windows app that detects installed Steam games and keeps them updated. It
 1. Finds Steam via the registry (HKCU\Software\Valve\Steam), including extra libraries from libraryfolders.vdf.
 2. Parses every appmanifest_*.acf to list installed games and their current build IDs.
 3. Detects pending updates two ways: Steam's own manifest flag (exactly what the Steam client shows) plus Valve's public UpToDateCheck API for apps that support it.
-4. If games are stale and Steam is closed: launches steam.exe -silent, waits (up to 15 min), then closes Steam.
-5. If Steam is already running: reports the pending updates and lets Steam handle them.
+4. If updates are pending: tells the running Steam client to download them immediately through its own UI API — no restart, no interruption (see "How forcing works" below).
+5. If Steam is closed: the app starts it silently with the debug flag, forces the downloads, and can close it again when finished.
 6. Optionally updates only inside a daily schedule window you set.
 
 ## Requirements
@@ -43,13 +43,29 @@ A tiny Windows app that detects installed Steam games and keeps them updated. It
 - "Check now" always checks and updates immediately, ignoring the schedule.
 - If the window ends mid-update while the app started Steam, it still waits for the update to finish before closing Steam.
 
+## How forcing works: the -cef-enable-debugging flag
+
+Steam's client window is a Chromium app (steamwebhelper.exe). Steam ships with a built-in launch flag, `-cef-enable-debugging`, that turns on a developer port for that UI on localhost:8080. This app uses that port to run the exact call Steam's own Update button makes — `SteamClient.Downloads.QueueAppUpdate(appid)` — inside Steam's UI. The running client then cancels its update schedule for that game and starts downloading immediately. Steam is not restarted and not interrupted while the port is available.
+
+What the app does:
+- Always launches Steam with the flag whenever it starts Steam itself.
+- Steam already running WITH the flag: pending updates are forced instantly, zero interruption.
+- Steam already running WITHOUT the flag: the app restarts Steam once to enable it — only when updates are pending, never while a game is running.
+
+To make your own Steam launches behave the same, add the flag to your Steam shortcut target:
+`"C:\Program Files (x86)\Steam\steam.exe" -cef-enable-debugging`
+
+Notes:
+- The debug port accepts connections from the same machine only (localhost). Nothing is exposed to your network.
+- `QueueAppUpdate` is an internal Steam UI call, not a documented Valve API. A future Steam update could change it; if forcing stops working, the app logs the queue errors and leaves updates to Steam.
+
 ## Settings
 
 - "Close Steam when done": closes Steam only when the app started it. It never closes Steam you opened yourself.
 - "Start with Windows": writes HKCU\...\Run\SteamAutoUpdater. Remove with the checkbox or delete the value.
 - "Only update on a schedule" plus the window: stored in %APPDATA%\SteamAutoUpdater\config.json along with the Close-Steam preference.
 - Check interval is 30 minutes inside the active window.
-- "Force updates even if Steam is running" (default on): if updates are pending while the Steam client is open, the app restarts Steam silently to force it to re-scan and download. It never does this while a game is running (it detects Steam's child processes and backs off).
+- "Force updates even if Steam is running" (default on): pending updates are forced immediately through Steam's own UI API when the debug port is up. If Steam is running without the flag, it is restarted once to get it (never during a game).
 - Log file: %APPDATA%\SteamAutoUpdater\log.txt records every API check (game, result, milliseconds) plus Steam kick/monitor events. Include this file in any bug report.
 
 ## Build from source (from the Mac mini)
@@ -59,10 +75,10 @@ python3 make_icon.py
 $HOME/go/bin/rsrc -manifest app.manifest -ico app.ico -o rsrc_windows_amd64.syso
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -H=windowsgui" -o SteamAutoUpdater.exe
 
-## Limitations (v1.1)
+## Limitations (v2.0)
 
-- Honors Steam's own per-game update settings when it kicks Steam.
-- Never kills Steam it did not start.
+- Never closes Steam it did not start.
+- Forcing uses an internal Steam UI call (see the flag section); a Steam client update could change it.
 - No tray icon yet; keep the window minimized and the schedule keeps running.
 - Valve's UpToDateCheck API returns no data for many modern games; those rely on Steam's own manifest flag, so the app always agrees with what Steam shows. Beta-branch games on API-supported apps may read Update available repeatedly.
 - Schedule is a single daily window (one start/end pair). Multiple windows per day are not supported yet.

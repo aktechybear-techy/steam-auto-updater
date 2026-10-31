@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -26,6 +27,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
 	"golang.org/x/sys/windows"
@@ -220,6 +222,7 @@ func runCycle(manual, kickAllowed bool) {
 	})
 
 	stale := 0
+	var staleGames []string
 	for i := range games {
 		if games[i].Flags&2 != 0 {
 			logf("appid %s (%s): UPDATE PENDING (Steam manifest flag)", games[i].AppID, games[i].Name)
@@ -229,6 +232,7 @@ func runCycle(manual, kickAllowed bool) {
 		}
 		if games[i].Status == "Update available" || games[i].Status == "Update pending" {
 			stale++
+			staleGames = append(staleGames, games[i].AppID)
 		}
 		snap := append([]game(nil), games...)
 		n, total := i+1, len(games)
@@ -264,10 +268,17 @@ func runCycle(manual, kickAllowed bool) {
 		return
 	}
 
-	if steamRunning() {
+	weStarted := false
+
+	if cdpEnabled() {
+		logf("steam debug port is up; forcing %d pending update(s) via Steam's own UI API", stale)
+		ui(func() {
+			sbi.SetText(fmt.Sprintf("Steam is running — forcing %d pending update(s) via Steam's API…", stale))
+		})
+	} else {
 		if !forceRestart.Load() {
-			logf("steam already running; force is off, deferring updates to it")
-			ui(func() { sbi.SetText("Steam is already running — it will apply these updates itself.") })
+			logf("no debug port; force is off, leaving updates to Steam")
+			ui(func() { sbi.SetText("Steam is running without the debug flag — updates left to Steam.") })
 			return
 		}
 		if busy, _ := steamBusyGame(); busy != "" {
@@ -284,23 +295,48 @@ func runCycle(manual, kickAllowed bool) {
 			})
 			return
 		}
-		logf("steam running, no game active; restarting it to force pending updates")
-		ui(func() { sbi.SetText("Steam is running — restarting it to force pending updates…") })
-		if !closeSteam() {
-			logf("could not stop steam; leaving it running")
-			ui(func() { sbi.SetText("Could not stop Steam — leaving it running with pending updates.") })
+		if steamRunning() {
+			logf("steam running without the debug flag; restarting it once to enable forcing")
+			ui(func() {
+				sbi.SetText("Steam is running without the debug flag — restarting it once to enable forcing…")
+			})
+			if !closeSteam() {
+				logf("could not stop steam; leaving it running")
+				ui(func() { sbi.SetText("Could not stop Steam — leaving it running with pending updates.") })
+				return
+			}
+			time.Sleep(3 * time.Second)
+		}
+		if err := startSteam(inst); err != nil {
+			logf("failed to start steam: %v", err)
+			ui(func() { sbi.SetText("Could not start Steam: " + err.Error()) })
 			return
 		}
-		time.Sleep(3 * time.Second)
+		weStarted = true
+		logf("launched steam.exe -silent -cef-enable-debugging; waiting for the debug port")
+		ui(func() { sbi.SetText("Steam starting with the debug flag…") })
+		if !waitForCDP(90 * time.Second) {
+			logf("debug port never came up after 90s; leaving updates to Steam")
+			ui(func() { sbi.SetText("Steam started but its debug port is not available — updates left to Steam.") })
+			return
+		}
 	}
 
-	if err := startSteam(inst); err != nil {
-		logf("failed to start steam: %v", err)
-		ui(func() { sbi.SetText("Could not start Steam: " + err.Error()) })
+	fired := 0
+	for _, appid := range staleGames {
+		if err := cdpQueueUpdate(appid); err != nil {
+			logf("appid %s: queue call failed: %v", appid, err)
+		} else {
+			fired++
+			logf("appid %s: update queued via Steam's UI API", appid)
+		}
+	}
+	if fired == 0 {
+		ui(func() { sbi.SetText("Could not queue updates through Steam's API — see the log.") })
 		return
 	}
-	logf("launched steam.exe -silent, monitoring for completion")
-	ui(func() { sbi.SetText(fmt.Sprintf("Steam started in the tray — updating %d game(s)…", stale)) })
+	logf("queued %d of %d pending update(s) for immediate download", fired, stale)
+	ui(func() { sbi.SetText(fmt.Sprintf("Steam is updating %d game(s)…", fired)) })
 
 	deadline := time.Now().Add(kickTimeout)
 	for time.Now().Before(deadline) {
@@ -324,7 +360,7 @@ func runCycle(manual, kickAllowed bool) {
 		ui(func() { model.publish(snap) })
 		if remaining == 0 {
 			forceStrikes.Store(0)
-			if closeWhenDone.Load() {
+			if weStarted && closeWhenDone.Load() {
 				logf("all games up to date — closing Steam (we started it)")
 				ui(func() { sbi.SetText("All games up to date — closing Steam…") })
 				closeSteam()
@@ -680,7 +716,9 @@ func steamBusyGame() (string, error) {
 }
 
 func startSteam(inst *steamInstall) error {
-	return exec.Command(inst.ExePath, "-silent").Start()
+	// -cef-enable-debugging opens Steam's UI debug port (localhost:8080),
+	// which the app uses to queue updates through Steam's own API.
+	return exec.Command(inst.ExePath, "-silent", "-cef-enable-debugging").Start()
 }
 
 func closeSteam() bool {
@@ -694,6 +732,129 @@ func closeSteam() bool {
 	_, _ = runHidden("taskkill", "/F", "/IM", "steam.exe")
 	time.Sleep(2 * time.Second)
 	return !steamRunning()
+}
+
+// ---------- Steam UI API via CDP ----------
+
+const cdpBase = "http://localhost:8080"
+
+// cdpEnabled reports whether Steam's CEF debug port is listening.
+func cdpEnabled() bool {
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:8080", 700*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// waitForCDP polls for the debug port, e.g. right after launching Steam.
+func waitForCDP(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cdpEnabled() {
+			return true
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return false
+}
+
+// cdpEval connects to Steam's debug port, finds a page context that has the
+// full SteamClient API (the SharedJSContext), and evaluates expr there.
+func cdpEval(expr string) (string, error) {
+	resp, err := http.Get(cdpBase + "/json")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var targets []struct {
+		Title                string `json:"title"`
+		Type                 string `json:"type"`
+		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&targets); err != nil {
+		return "", err
+	}
+
+	order := make([]int, 0, len(targets))
+	for i := range targets {
+		if targets[i].Type != "page" {
+			continue
+		}
+		if strings.Contains(targets[i].Title, "SharedJSContext") {
+			order = append([]int{i}, order...)
+		} else {
+			order = append(order, i)
+		}
+	}
+
+	for _, i := range order {
+		ws, _, err := websocket.DefaultDialer.Dial(targets[i].WebSocketDebuggerURL, nil)
+		if err != nil {
+			continue
+		}
+		ok, err := cdpEvalOn(ws, "typeof SteamClient === 'object' && typeof SteamClient.Downloads === 'object'")
+		if err != nil || ok != "true" {
+			_ = ws.Close()
+			continue
+		}
+		val, err := cdpEvalOn(ws, expr)
+		_ = ws.Close()
+		return val, err
+	}
+	return "", fmt.Errorf("no Steam page context with SteamClient.Downloads found")
+}
+
+// cdpEvalOn runs one Runtime.evaluate over an open debug connection.
+func cdpEvalOn(ws *websocket.Conn, expr string) (string, error) {
+	id := time.Now().UnixNano()
+	if err := ws.WriteJSON(map[string]interface{}{
+		"id":     id,
+		"method": "Runtime.evaluate",
+		"params": map[string]interface{}{"expression": expr, "returnByValue": true, "awaitPromise": true},
+	}); err != nil {
+		return "", err
+	}
+	_ = ws.SetReadDeadline(time.Now().Add(15 * time.Second))
+	for {
+		var msg struct {
+			ID     int64 `json:"id"`
+			Result struct {
+				Result struct {
+					Type        string      `json:"type"`
+					Value       interface{} `json:"value"`
+					Subtype     string      `json:"subtype"`
+					Description string      `json:"description"`
+				} `json:"result"`
+			} `json:"result"`
+		}
+		if err := ws.ReadJSON(&msg); err != nil {
+			return "", err
+		}
+		if msg.ID != id {
+			continue
+		}
+		if msg.Result.Result.Subtype == "error" {
+			return "", fmt.Errorf("%s", msg.Result.Result.Description)
+		}
+		return fmt.Sprintf("%v", msg.Result.Result.Value), nil
+	}
+}
+
+// cdpQueueUpdate makes the running Steam client queue appid's update for
+// immediate download — the same call Steam's own Update button makes.
+func cdpQueueUpdate(appid string) error {
+	if len(appid) == 0 {
+		return fmt.Errorf("empty appid")
+	}
+	for _, c := range appid {
+		if c < '0' || c > '9' {
+			return fmt.Errorf("invalid appid %q", appid)
+		}
+	}
+	_, err := cdpEval("SteamClient.Downloads.QueueAppUpdate(" + appid + ", 0)")
+	return err
 }
 
 // runHidden runs a console command without flashing a console window.
